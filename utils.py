@@ -1,0 +1,216 @@
+import numpy as np
+import scipy as sc
+import tensorflow as tf
+import tensorflow_probability as tfp
+
+tfd = tfp.distributions
+tfb = tfp.bijectors
+from sklearn import mixture
+import math as m
+from scipy import interpolate
+from matplotlib import pyplot as plt
+
+
+# Function to split the data in training, testing and validation sets
+def splitData(data, split_fracs=[0.8, 0.2]):
+    n_data_points = data.shape[0]
+    if len(split_fracs) == 2:
+        num_trn = round(n_data_points * split_fracs[0])
+        num_tst = round(n_data_points * split_fracs[1])
+        num_vld = 0
+    elif len(split_fracs) == 3:
+        num_trn = round(n_data_points * split_fracs[0])
+        num_vld = round(n_data_points * split_fracs[1])
+        num_tst = round(n_data_points * split_fracs[2])
+
+        # splitting the data in training, testing and validation sets
+    #np.random.shuffle(data)
+    data_trn, data_vld, data_tst, _ = np.split(data, np.cumsum([num_trn, num_vld, num_tst]))
+    return data_trn, data_vld, data_tst
+
+
+# Function to compute numerical gradient using central finite difference
+def gradientFiniteDifference(func, theta, delta=1E-4):
+    n = np.size(theta)
+    grad = np.zeros((n))
+    for i in range(n):
+        theta_p = np.copy(theta)
+        theta_m = np.copy(theta)
+        theta_p[i] = theta_p[i] + delta
+        theta_m[i] = theta_m[i] - delta
+        f_plus = func(tf.constant(theta_p, dtype=tf.float32)).numpy()
+        f_minus = func(tf.constant(theta_m, dtype=tf.float32)).numpy()
+        grad[i] = (f_plus - f_minus) / (2 * delta)
+    return grad
+
+
+def newton(f,Df,x0,epsilon,max_iter):
+    '''Approximate solution of f(x)=0 by Newton's method.
+
+    Parameters
+    ----------
+    f : function
+        Function for which we are searching for a solution f(x)=0.
+    Df : function
+        Derivative of f(x).
+    x0 : number
+        Initial guess for a solution f(x)=0.
+    epsilon : number
+        Stopping criteria is abs(f(x)) < epsilon.
+    max_iter : integer
+        Maximum number of iterations of Newton's method.
+
+    Returns
+    -------
+    xn : number
+        Implement Newton's method: compute the linear approximation
+        of f(x) at xn and find x intercept by the formula
+            x = xn - f(xn)/Df(xn)
+        Continue until abs(f(xn)) < epsilon and return xn.
+        If Df(xn) == 0, return None. If the number of iterations
+        exceeds max_iter, then return None.
+
+    Examples
+    --------
+    Found solution after 5 iterations.
+    1.618033988749989
+    '''
+    xn = x0
+    for n in range(0,max_iter):
+        fxn = f(xn)
+        if abs(fxn) < epsilon:
+            print('Found solution after',n,'iterations.')
+            return xn
+        Dfxn = Df(xn)
+        if Dfxn == 0:
+            print('Zero derivative. No solution found.')
+            return None
+        xn = xn - fxn/Dfxn
+    print('Exceeded maximum iterations. No solution found.')
+    return None
+
+# moving average of an array
+def moving_average(x, w):
+    return np.convolve(x, np.ones(w), 'valid') / w
+
+
+# Numerically finding the icdf values for a distribution whos analytical CDF is specified
+def icdf_numerical(u, cdf_funct, lb, ub):
+    # setting up the numerical method (Chandrupatla root finding algorithm) to find icdf
+    obj_func = lambda x: cdf_funct(x) - u
+    # finding the roots
+    x = tfp.math.find_root_chandrupatla(obj_func, low=lb, high=ub,position_tolerance=1e-10,
+    value_tolerance=1e-10)[0]
+    #x=tfp.math.find_root_chandrupatla(obj_func)[0]
+    return x
+
+
+def GMM_best_fit(samples, min_ncomp=1, max_ncomp=10, max_iter=200, print_info=False):
+    lowest_bic = np.infty
+    bic = []
+    for n_components in range(min_ncomp, max_ncomp + 1):
+        # Fit a Gaussian mixture with EM
+        gmm = mixture.GaussianMixture(n_components=n_components,
+                                      covariance_type='full',
+                                      reg_covar=1E-4,
+                                      max_iter=max_iter,
+                                      n_init=5)
+        gmm.fit(samples)
+        if print_info:
+            print('Fittng a GMM on samples with %s components: BIC=%f' % (n_components, gmm.bic(samples)))
+        bic.append(gmm.bic(samples))
+        if bic[-1] < lowest_bic:
+            lowest_bic = bic[-1]
+            best_gmm = gmm
+    return best_gmm
+
+
+# Standardize GMM parameters
+def standardize_gmm_params(alphas, mus, covs, chols=[]):
+    weighted_mus = tf.linalg.matvec(tf.transpose(mus), alphas)
+    new_mus = mus - weighted_mus
+    variances = tf.linalg.diag_part(covs)
+    scaling_vec = tf.linalg.matvec(tf.transpose(new_mus ** 2 + variances), alphas)
+    scaling_matrix = tf.linalg.diag(1 / (scaling_vec ** 0.5))
+    new_mus = tf.linalg.matmul(new_mus, scaling_matrix)
+    #     new_covs = tf.linalg.matmul(covs,scaling_matrix**2)
+    new_covs = tf.linalg.matmul(tf.linalg.matmul(scaling_matrix, covs), scaling_matrix)
+    new_chols = tf.linalg.matmul(scaling_matrix, chols) if len(chols) else []
+    return alphas, new_mus, new_covs, new_chols
+
+
+def vec2gmm_params(n_dims, n_comps, param_vec):
+    num_alpha_params = n_comps
+    num_mu_params = n_comps * n_dims
+    num_sig_params = int(n_comps * n_dims * (n_dims + 1) * 0.5)
+    logit_param, mu_param, chol_param = tf.split(param_vec, [num_alpha_params, num_mu_params, num_sig_params])
+    mu_vectors = tf.reshape(mu_param, shape=(n_comps, n_dims))
+    chol_mat_array = tf.TensorArray(tf.float32, size=n_comps)
+    cov_mat_array = tf.TensorArray(tf.float32, size=n_comps)
+    for k in range(n_comps):
+        start_idx = tf.cast(k * (num_sig_params / n_comps), tf.int32)
+        end_idx = tf.cast((k + 1) * (num_sig_params / n_comps), tf.int32)
+        chol_mat = tfb.FillScaleTriL(diag_bijector=tfb.Exp()).forward(chol_param[start_idx:end_idx])
+        cov_mat = tf.matmul(chol_mat, tf.transpose(chol_mat))
+        chol_mat_array = chol_mat_array.write(k, chol_mat)
+        cov_mat_array = cov_mat_array.write(k, cov_mat)
+
+    chol_matrices = chol_mat_array.stack()
+    cov_matrices = cov_mat_array.stack()
+    return [logit_param, mu_vectors, cov_matrices, chol_matrices]
+
+
+def gmm_params2vec(n_dims, n_comps, alphas, mu_vectors, cov_matrices, chol_matrices=[]):
+    # now gathering all the parameters into a single vector
+    param_list = []
+    param_list.append(np.log(alphas))
+    param_list.append(tf.reshape(mu_vectors, -1))
+    for k in range(n_comps):
+        chol_mat = chol_matrices[k] if len(chol_matrices) else tf.linalg.cholesky(cov_matrices[k])
+        param_list.append(tfb.FillScaleTriL(diag_bijector=tfb.Exp()).inverse(chol_mat))
+    param_vec = tf.concat(param_list, axis=0)
+    return param_vec
+
+
+def plotDensityContours(data, log_prob, dim1, dim2):
+    # PLOTTING THE DENSITY CONTOURS OF LEARNED GMCM
+    mins = np.min(data, axis=0)
+    maxs = np.max(data, axis=0)
+    # specifying the gridsie for density plotting
+    ngrid = 100
+    X, Y = np.meshgrid(np.linspace(mins[dim1], maxs[dim1], ngrid), (np.linspace(mins[dim2], maxs[dim2], ngrid)))
+    X = X.astype('float32')
+    Y = Y.astype('float32')
+    z = np.concatenate([X.reshape(-1, 1), Y.reshape(-1, 1)], axis=1)
+    # computing the GMCM density values
+    prob_z = np.exp(log_prob(z).numpy())
+    # reshaping the density vector
+    Z = prob_z.reshape(ngrid, ngrid)
+    # Plotting the density contours along with the  data
+    plt.contour(X, Y, Z, 20)
+    plt.plot(data[:, dim1], data[:, dim2], 'ko')
+    plt.xlabel(f'dim_{dim1}', fontsize=14)
+    plt.ylabel(f'dim_{dim2}', fontsize=14)
+
+
+def fitMargNonParam(x1_array):
+    x1_array_sorted = np.zeros_like(x1_array)
+    u1_array = np.zeros_like(x1_array)
+    #     x2_array = np.zeros_like(x1_array)
+    #     u2_array = np.zeros_like(x1_array)
+    nsamps, ndims = x1_array.shape
+    for j in range(ndims):
+        curr_obs = x1_array[:, j] + np.random.normal(0, 1E-6,
+                                                     nsamps)  # adding a small noise to maintain unique ness of samples
+        ranks = np.empty_like(curr_obs)
+        ranks[np.argsort(curr_obs)] = np.arange(nsamps)
+        x1_array_sorted[:, j] = np.sort(curr_obs)
+        u1_array[:, j] = ranks / (nsamps - 1)
+    #         x2_array[:,j] = np.linspace(np.min(curr_obs),np.max(curr_obs),nsamps)
+    #         u2_array[:,j] = scipy_interp1d(x2_array[:,j],curr_obs,u1_array[:,j],method='linear')
+    #     # specifying non-parametric marginals as a dict
+    #     marg_params = {'u_range': [np.min(u1_array,axis=0), np.max(u1_array,axis=0)], \
+    #                     'x_values': x1_array_sorted,\
+    #                     'x_range': [np.min(x2_array,axis=0),np.max(x2_array,axis=0)], \
+    #                     'u_values': u2_array}
+    return u1_array
